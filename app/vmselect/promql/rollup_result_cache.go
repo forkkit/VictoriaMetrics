@@ -10,14 +10,21 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/VictoriaMetrics/metricsql"
 )
 
-var disableCache = flag.Bool("search.disableCache", false, "Whether to disable response caching. This may be useful during data backfilling")
+var (
+	disableCache         = flag.Bool("search.disableCache", false, "Whether to disable response caching. This may be useful during data backfilling")
+	cacheTimestampOffset = flag.Duration("search.cacheTimestampOffset", 5*time.Minute, "The maximum duration since the current time for response data, "+
+		"which is always queried from the original raw data, without using the response cache. Increase this value if you see gaps in responses "+
+		"due to time synchronization issues between VictoriaMetrics and data sources")
+)
 
 var rollupResultCacheV = &rollupResultCache{
 	c: workingsetcache.New(1024*1024, time.Hour), // This is a cache for testing.
@@ -58,23 +65,23 @@ func InitRollupResultCache(cachePath string) {
 
 	stats := &fastcache.Stats{}
 	var statsLock sync.Mutex
-	var statsLastUpdate time.Time
+	var statsLastUpdate uint64
 	fcs := func() *fastcache.Stats {
 		statsLock.Lock()
 		defer statsLock.Unlock()
 
-		if time.Since(statsLastUpdate) < time.Second {
+		if fasttime.UnixTimestamp()-statsLastUpdate < 2 {
 			return stats
 		}
 		var fcs fastcache.Stats
 		c.UpdateStats(&fcs)
 		stats = &fcs
-		statsLastUpdate = time.Now()
+		statsLastUpdate = fasttime.UnixTimestamp()
 		return stats
 	}
 	if len(rollupResultCachePath) > 0 {
-		logger.Infof("loaded rollupResult cache from %q in %s; entriesCount: %d, sizeBytes: %d",
-			rollupResultCachePath, time.Since(startTime), fcs().EntriesCount, fcs().BytesSize)
+		logger.Infof("loaded rollupResult cache from %q in %.3f seconds; entriesCount: %d, sizeBytes: %d",
+			rollupResultCachePath, time.Since(startTime).Seconds(), fcs().EntriesCount, fcs().BytesSize)
 	}
 
 	metrics.NewGauge(`vm_cache_entries{type="promql/rollupResult"}`, func() float64 {
@@ -112,8 +119,8 @@ func StopRollupResultCache() {
 	rollupResultCacheV.c.UpdateStats(&fcs)
 	rollupResultCacheV.c.Stop()
 	rollupResultCacheV.c = nil
-	logger.Infof("saved rollupResult cache to %q in %s; entriesCount: %d, sizeBytes: %d",
-		rollupResultCachePath, time.Since(startTime), fcs.EntriesCount, fcs.BytesSize)
+	logger.Infof("saved rollupResult cache to %q in %.3f seconds; entriesCount: %d, sizeBytes: %d",
+		rollupResultCachePath, time.Since(startTime).Seconds(), fcs.EntriesCount, fcs.BytesSize)
 }
 
 type rollupResultCache struct {
@@ -126,9 +133,10 @@ var rollupResultCacheResets = metrics.NewCounter(`vm_cache_resets_total{type="pr
 func ResetRollupResultCache() {
 	rollupResultCacheResets.Inc()
 	rollupResultCacheV.c.Reset()
+	logger.Infof("rollupResult cache has been cleared")
 }
 
-func (rrc *rollupResultCache) Get(funcName string, ec *EvalConfig, me *metricExpr, iafc *incrementalAggrFuncContext, window int64) (tss []*timeseries, newStart int64) {
+func (rrc *rollupResultCache) Get(ec *EvalConfig, expr metricsql.Expr, window int64) (tss []*timeseries, newStart int64) {
 	if *disableCache || !ec.mayCache() {
 		return nil, ec.Start
 	}
@@ -137,7 +145,7 @@ func (rrc *rollupResultCache) Get(funcName string, ec *EvalConfig, me *metricExp
 	bb := bbPool.Get()
 	defer bbPool.Put(bb)
 
-	bb.B = marshalRollupResultCacheKey(bb.B[:0], funcName, me, iafc, window, ec.Step)
+	bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step)
 	metainfoBuf := rrc.c.Get(nil, bb.B)
 	if len(metainfoBuf) == 0 {
 		return nil, ec.Start
@@ -157,7 +165,7 @@ func (rrc *rollupResultCache) Get(funcName string, ec *EvalConfig, me *metricExp
 	if len(compressedResultBuf.B) == 0 {
 		mi.RemoveKey(key)
 		metainfoBuf = mi.Marshal(metainfoBuf[:0])
-		bb.B = marshalRollupResultCacheKey(bb.B[:0], funcName, me, iafc, window, ec.Step)
+		bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step)
 		rrc.c.Set(bb.B, metainfoBuf)
 		return nil, ec.Start
 	}
@@ -209,15 +217,15 @@ func (rrc *rollupResultCache) Get(funcName string, ec *EvalConfig, me *metricExp
 
 var resultBufPool bytesutil.ByteBufferPool
 
-func (rrc *rollupResultCache) Put(funcName string, ec *EvalConfig, me *metricExpr, iafc *incrementalAggrFuncContext, window int64, tss []*timeseries) {
+func (rrc *rollupResultCache) Put(ec *EvalConfig, expr metricsql.Expr, window int64, tss []*timeseries) {
 	if *disableCache || len(tss) == 0 || !ec.mayCache() {
 		return
 	}
 
-	// Remove values up to currentTime - step - maxSilenceInterval,
+	// Remove values up to currentTime - step - cacheTimestampOffset,
 	// since these values may be added later.
 	timestamps := tss[0].Timestamps
-	deadline := (time.Now().UnixNano() / 1e6) - ec.Step - maxSilenceInterval
+	deadline := (time.Now().UnixNano() / 1e6) - ec.Step - cacheTimestampOffset.Milliseconds()
 	i := len(timestamps) - 1
 	for i >= 0 && timestamps[i] > deadline {
 		i--
@@ -260,7 +268,7 @@ func (rrc *rollupResultCache) Put(funcName string, ec *EvalConfig, me *metricExp
 	bb.B = key.Marshal(bb.B[:0])
 	rrc.c.SetBig(bb.B, compressedResultBuf.B)
 
-	bb.B = marshalRollupResultCacheKey(bb.B[:0], funcName, me, iafc, window, ec.Step)
+	bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step)
 	metainfoBuf := rrc.c.Get(nil, bb.B)
 	var mi rollupResultCacheMetainfo
 	if len(metainfoBuf) > 0 {
@@ -288,23 +296,13 @@ var (
 var tooBigRollupResults = metrics.NewCounter("vm_too_big_rollup_results_total")
 
 // Increment this value every time the format of the cache changes.
-const rollupResultCacheVersion = 6
+const rollupResultCacheVersion = 7
 
-func marshalRollupResultCacheKey(dst []byte, funcName string, me *metricExpr, iafc *incrementalAggrFuncContext, window, step int64) []byte {
+func marshalRollupResultCacheKey(dst []byte, expr metricsql.Expr, window, step int64) []byte {
 	dst = append(dst, rollupResultCacheVersion)
-	if iafc == nil {
-		dst = append(dst, 0)
-	} else {
-		dst = append(dst, 1)
-		dst = iafc.ae.AppendString(dst)
-	}
-	dst = encoding.MarshalUint64(dst, uint64(len(funcName)))
-	dst = append(dst, funcName...)
 	dst = encoding.MarshalInt64(dst, window)
 	dst = encoding.MarshalInt64(dst, step)
-	for i := range me.TagFilters {
-		dst = me.TagFilters[i].Marshal(dst)
-	}
+	dst = expr.AppendString(dst)
 	return dst
 }
 

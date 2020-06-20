@@ -13,7 +13,7 @@ import (
 type partSearch struct {
 	// Item contains the last item found after the call to NextItem.
 	//
-	// The Item content is valud intil the next call to NextItem.
+	// The Item content is valid until the next call to NextItem.
 	Item []byte
 
 	// p is a part to search.
@@ -24,9 +24,6 @@ type partSearch struct {
 
 	// The remaining block headers to scan in the current metaindexRow.
 	bhs []blockHeader
-
-	// Pointer to index block, which may be reused.
-	indexBlockReuse *indexBlock
 
 	// Pointer to inmemory block, which may be reused.
 	inmemoryBlockReuse *inmemoryBlock
@@ -53,10 +50,6 @@ func (ps *partSearch) reset() {
 	ps.p = nil
 	ps.mrs = nil
 	ps.bhs = nil
-	if ps.indexBlockReuse != nil {
-		putIndexBlock(ps.indexBlockReuse)
-		ps.indexBlockReuse = nil
-	}
 	if ps.inmemoryBlockReuse != nil {
 		putInmemoryBlock(ps.inmemoryBlockReuse)
 		ps.inmemoryBlockReuse = nil
@@ -82,8 +75,8 @@ func (ps *partSearch) Init(p *part, shouldCacheBlock func(item []byte) bool) {
 	ps.reset()
 
 	ps.p = p
-	ps.idxbCache = &p.idxbCache
-	ps.ibCache = &p.ibCache
+	ps.idxbCache = p.idxbCache
+	ps.ibCache = p.ibCache
 }
 
 // Seek seeks for the first item greater or equal to k in ps.
@@ -275,43 +268,28 @@ func (ps *partSearch) nextBlock() error {
 }
 
 func (ps *partSearch) nextBHS() error {
-	if ps.indexBlockReuse != nil {
-		putIndexBlock(ps.indexBlockReuse)
-		ps.indexBlockReuse = nil
-	}
 	if len(ps.mrs) == 0 {
 		return io.EOF
 	}
 	mr := &ps.mrs[0]
 	ps.mrs = ps.mrs[1:]
-	idxb, mayReuseIndexBlock, err := ps.getIndexBlock(mr)
-	if err != nil {
-		return fmt.Errorf("cannot get index block: %s", err)
-	}
-	if mayReuseIndexBlock {
-		ps.indexBlockReuse = idxb
+	idxbKey := mr.indexBlockOffset
+	idxb := ps.idxbCache.Get(idxbKey)
+	if idxb == nil {
+		var err error
+		idxb, err = ps.readIndexBlock(mr)
+		if err != nil {
+			return fmt.Errorf("cannot read index block: %s", err)
+		}
+		ps.idxbCache.Put(idxbKey, idxb)
 	}
 	ps.bhs = idxb.bhs
 	return nil
 }
 
-func (ps *partSearch) getIndexBlock(mr *metaindexRow) (*indexBlock, bool, error) {
-	idxbKey := mr.indexBlockOffset
-	idxb := ps.idxbCache.Get(idxbKey)
-	if idxb != nil {
-		return idxb, false, nil
-	}
-	idxb, err := ps.readIndexBlock(mr)
-	if err != nil {
-		return nil, false, err
-	}
-	ok := ps.idxbCache.Put(idxbKey, idxb)
-	return idxb, !ok, nil
-}
-
 func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
 	ps.compressedIndexBuf = bytesutil.Resize(ps.compressedIndexBuf, int(mr.indexBlockSize))
-	ps.p.indexFile.ReadAt(ps.compressedIndexBuf, int64(mr.indexBlockOffset))
+	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.indexBlockOffset))
 
 	var err error
 	ps.indexBuf, err = encoding.DecompressZSTD(ps.indexBuf[:0], ps.compressedIndexBuf)
@@ -347,18 +325,18 @@ func (ps *partSearch) getInmemoryBlock(bh *blockHeader) (*inmemoryBlock, bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	ok := ps.ibCache.Put(ibKey, ib)
-	return ib, !ok, nil
+	ps.ibCache.Put(ibKey, ib)
+	return ib, false, nil
 }
 
 func (ps *partSearch) readInmemoryBlock(bh *blockHeader) (*inmemoryBlock, error) {
 	ps.sb.Reset()
 
 	ps.sb.itemsData = bytesutil.Resize(ps.sb.itemsData, int(bh.itemsBlockSize))
-	ps.p.itemsFile.ReadAt(ps.sb.itemsData, int64(bh.itemsBlockOffset))
+	ps.p.itemsFile.MustReadAt(ps.sb.itemsData, int64(bh.itemsBlockOffset))
 
 	ps.sb.lensData = bytesutil.Resize(ps.sb.lensData, int(bh.lensBlockSize))
-	ps.p.lensFile.ReadAt(ps.sb.lensData, int64(bh.lensBlockOffset))
+	ps.p.lensFile.MustReadAt(ps.sb.lensData, int64(bh.lensBlockOffset))
 
 	ib := getInmemoryBlock()
 	if err := ib.UnmarshalData(&ps.sb, bh.firstItem, bh.commonPrefix, bh.itemsCount, bh.marshalType); err != nil {

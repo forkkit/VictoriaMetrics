@@ -1,5 +1,8 @@
-FROM scratch
-COPY --from=local/certs:1.0.2 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY bin/victoria-metrics-prod .
+ARG base_image
+FROM $base_image
+
 EXPOSE 8428
+
 ENTRYPOINT ["/victoria-metrics-prod"]
+ARG src_binary
+COPY $src_binary ./victoria-metrics-prod

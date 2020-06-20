@@ -3,12 +3,50 @@
 victoria-metrics:
 	APP_NAME=victoria-metrics $(MAKE) app-local
 
+victoria-metrics-race:
+	APP_NAME=victoria-metrics RACE=-race $(MAKE) app-local
+
 victoria-metrics-prod:
 	APP_NAME=victoria-metrics $(MAKE) app-via-docker
 
+victoria-metrics-pure-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-pure
+
+victoria-metrics-amd64-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-amd64
+
+victoria-metrics-arm-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-arm
+
+victoria-metrics-arm64-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-arm64
+
+victoria-metrics-ppc64le-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-ppc64le
+
+victoria-metrics-386-prod:
+	APP_NAME=victoria-metrics $(MAKE) app-via-docker-386
+
 package-victoria-metrics:
-	APP_NAME=victoria-metrics \
-	$(MAKE) package-via-docker
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker
+
+package-victoria-metrics-pure:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-pure
+
+package-victoria-metrics-amd64:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-amd64
+
+package-victoria-metrics-arm:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-arm
+
+package-victoria-metrics-arm64:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-arm64
+
+package-victoria-metrics-ppc64le:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-ppc64le
+
+package-victoria-metrics-386:
+	APP_NAME=victoria-metrics $(MAKE) package-via-docker-386
 
 publish-victoria-metrics:
 	APP_NAME=victoria-metrics $(MAKE) publish-via-docker
@@ -20,23 +58,23 @@ run-victoria-metrics:
 	ARGS='-graphiteListenAddr=:2003 -opentsdbListenAddr=:4242 -retentionPeriod=12 -search.maxUniqueTimeseries=1000000 -search.maxQueryDuration=10m' \
 	$(MAKE) run-via-docker
 
+victoria-metrics-amd64:
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GO111MODULE=on go build -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/victoria-metrics-amd64 ./app/victoria-metrics
+
 victoria-metrics-arm:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GO111MODULE=on go build -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/victoria-metrics-arm ./app/victoria-metrics
-
-victoria-metrics-arm-prod:
-	APP_NAME=victoria-metrics APP_SUFFIX='-arm' DOCKER_OPTS='--env CGO_ENABLED=0 --env GOARCH=arm' $(MAKE) app-via-docker
 
 victoria-metrics-arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GO111MODULE=on go build -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/victoria-metrics-arm64 ./app/victoria-metrics
 
-victoria-metrics-arm64-prod:
-	APP_NAME=victoria-metrics APP_SUFFIX='-arm64' DOCKER_OPTS='--env CGO_ENABLED=0 --env GOARCH=arm64' $(MAKE) app-via-docker
+victoria-metrics-ppc64le:
+	CGO_ENABLED=0 GOOS=linux GOARCH=ppc64le GO111MODULE=on go build -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/victoria-metrics-ppc64le ./app/victoria-metrics
+
+victoria-metrics-386:
+	CGO_ENABLED=0 GOOS=linux GOARCH=386 GO111MODULE=on go build -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/victoria-metrics-386 ./app/victoria-metrics
 
 victoria-metrics-pure:
 	APP_NAME=victoria-metrics $(MAKE) app-local-pure
-
-victoria-metrics-pure-prod:
-	APP_NAME=victoria-metrics APP_SUFFIX='-pure' DOCKER_OPTS='--env CGO_ENABLED=0' $(MAKE) app-via-docker
 
 ### Packaging as DEB - amd64
 victoria-metrics-package-deb: victoria-metrics-prod

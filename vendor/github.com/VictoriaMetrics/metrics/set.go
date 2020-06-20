@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"sort"
@@ -29,6 +30,8 @@ func NewSet() *Set {
 
 // WritePrometheus writes all the metrics from s to w in Prometheus format.
 func (s *Set) WritePrometheus(w io.Writer) {
+	// Collect all the metrics in in-memory buffer in order to prevent from long locking due to slow w.
+	var bb bytes.Buffer
 	lessFunc := func(i, j int) bool {
 		return s.a[i].name < s.a[j].name
 	}
@@ -39,15 +42,78 @@ func (s *Set) WritePrometheus(w io.Writer) {
 	if !sort.SliceIsSorted(s.a, lessFunc) {
 		sort.Slice(s.a, lessFunc)
 	}
-	for _, nm := range s.a {
-		nm.metric.marshalTo(nm.name, w)
-	}
+	sa := append([]*namedMetric(nil), s.a...)
 	s.mu.Unlock()
+
+	// Call marshalTo without the global lock, since certain metric types such as Gauge
+	// can call a callback, which, in turn, can try calling s.mu.Lock again.
+	for _, nm := range sa {
+		nm.metric.marshalTo(nm.name, &bb)
+	}
+	w.Write(bb.Bytes())
+}
+
+// NewHistogram creates and returns new histogram in s with the given name.
+//
+// name must be valid Prometheus-compatible metric with possible labels.
+// For instance,
+//
+//     * foo
+//     * foo{bar="baz"}
+//     * foo{bar="baz",aaa="b"}
+//
+// The returned histogram is safe to use from concurrent goroutines.
+func (s *Set) NewHistogram(name string) *Histogram {
+	h := &Histogram{}
+	s.registerMetric(name, h)
+	return h
+}
+
+// GetOrCreateHistogram returns registered histogram in s with the given name
+// or creates new histogram if s doesn't contain histogram with the given name.
+//
+// name must be valid Prometheus-compatible metric with possible labels.
+// For instance,
+//
+//     * foo
+//     * foo{bar="baz"}
+//     * foo{bar="baz",aaa="b"}
+//
+// The returned histogram is safe to use from concurrent goroutines.
+//
+// Performance tip: prefer NewHistogram instead of GetOrCreateHistogram.
+func (s *Set) GetOrCreateHistogram(name string) *Histogram {
+	s.mu.Lock()
+	nm := s.m[name]
+	s.mu.Unlock()
+	if nm == nil {
+		// Slow path - create and register missing histogram.
+		if err := validateMetric(name); err != nil {
+			panic(fmt.Errorf("BUG: invalid metric name %q: %s", name, err))
+		}
+		nmNew := &namedMetric{
+			name:   name,
+			metric: &Histogram{},
+		}
+		s.mu.Lock()
+		nm = s.m[name]
+		if nm == nil {
+			nm = nmNew
+			s.m[name] = nm
+			s.a = append(s.a, nm)
+		}
+		s.mu.Unlock()
+	}
+	h, ok := nm.metric.(*Histogram)
+	if !ok {
+		panic(fmt.Errorf("BUG: metric %q isn't a Histogram. It is %T", name, nm.metric))
+	}
+	return h
 }
 
 // NewCounter registers and returns new counter with the given name in the s.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -64,7 +130,7 @@ func (s *Set) NewCounter(name string) *Counter {
 // GetOrCreateCounter returns registered counter in s with the given name
 // or creates new counter if s doesn't contain counter with the given name.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -103,6 +169,64 @@ func (s *Set) GetOrCreateCounter(name string) *Counter {
 	return c
 }
 
+// NewFloatCounter registers and returns new FloatCounter with the given name in the s.
+//
+// name must be valid Prometheus-compatible metric with possible labels.
+// For instance,
+//
+//     * foo
+//     * foo{bar="baz"}
+//     * foo{bar="baz",aaa="b"}
+//
+// The returned FloatCounter is safe to use from concurrent goroutines.
+func (s *Set) NewFloatCounter(name string) *FloatCounter {
+	c := &FloatCounter{}
+	s.registerMetric(name, c)
+	return c
+}
+
+// GetOrCreateFloatCounter returns registered FloatCounter in s with the given name
+// or creates new FloatCounter if s doesn't contain FloatCounter with the given name.
+//
+// name must be valid Prometheus-compatible metric with possible labels.
+// For instance,
+//
+//     * foo
+//     * foo{bar="baz"}
+//     * foo{bar="baz",aaa="b"}
+//
+// The returned FloatCounter is safe to use from concurrent goroutines.
+//
+// Performance tip: prefer NewFloatCounter instead of GetOrCreateFloatCounter.
+func (s *Set) GetOrCreateFloatCounter(name string) *FloatCounter {
+	s.mu.Lock()
+	nm := s.m[name]
+	s.mu.Unlock()
+	if nm == nil {
+		// Slow path - create and register missing counter.
+		if err := validateMetric(name); err != nil {
+			panic(fmt.Errorf("BUG: invalid metric name %q: %s", name, err))
+		}
+		nmNew := &namedMetric{
+			name:   name,
+			metric: &FloatCounter{},
+		}
+		s.mu.Lock()
+		nm = s.m[name]
+		if nm == nil {
+			nm = nmNew
+			s.m[name] = nm
+			s.a = append(s.a, nm)
+		}
+		s.mu.Unlock()
+	}
+	c, ok := nm.metric.(*FloatCounter)
+	if !ok {
+		panic(fmt.Errorf("BUG: metric %q isn't a Counter. It is %T", name, nm.metric))
+	}
+	return c
+}
+
 // NewGauge registers and returns gauge with the given name in s, which calls f
 // to obtain gauge value.
 //
@@ -130,7 +254,7 @@ func (s *Set) NewGauge(name string, f func() float64) *Gauge {
 // GetOrCreateGauge returns registered gauge with the given name in s
 // or creates new gauge if s doesn't contain gauge with the given name.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -176,7 +300,7 @@ func (s *Set) GetOrCreateGauge(name string, f func() float64) *Gauge {
 
 // NewSummary creates and returns new summary with the given name in s.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -191,7 +315,7 @@ func (s *Set) NewSummary(name string) *Summary {
 // NewSummaryExt creates and returns new summary in s with the given name,
 // window and quantiles.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -213,7 +337,7 @@ func (s *Set) NewSummaryExt(name string, window time.Duration, quantiles []float
 // GetOrCreateSummary returns registered summary with the given name in s
 // or creates new summary if s doesn't contain summary with the given name.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -231,7 +355,7 @@ func (s *Set) GetOrCreateSummary(name string) *Summary {
 // window and quantiles in s or creates new summary if s doesn't
 // contain summary with the given name.
 //
-// name must be valid Prometheus-compatible metric with possible lables.
+// name must be valid Prometheus-compatible metric with possible labels.
 // For instance,
 //
 //     * foo
@@ -313,4 +437,63 @@ func (s *Set) registerMetric(name string, m metric) {
 	if ok {
 		panic(fmt.Errorf("BUG: metric %q is already registered", name))
 	}
+}
+
+// UnregisterMetric removes metric with the given name from s.
+//
+// True is returned if the metric has been removed.
+// False is returned if the given metric is missing in s.
+func (s *Set) UnregisterMetric(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nm, ok := s.m[name]
+	if !ok {
+		return false
+	}
+	m := nm.metric
+
+	delete(s.m, name)
+
+	// remove metric from s.a
+	found := false
+	for i, nm := range s.a {
+		if nm.name == name {
+			s.a = append(s.a[:i], s.a[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		panic(fmt.Errorf("BUG: cannot find metric %q in the list of registered metrics", name))
+	}
+	sm, ok := m.(*Summary)
+	if !ok {
+		// There is no need in cleaning up s.summaries.
+		return true
+	}
+
+	// Remove sm from s.summaries
+	found = false
+	for i, xsm := range s.summaries {
+		if xsm == sm {
+			s.summaries = append(s.summaries[:i], s.summaries[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		panic(fmt.Errorf("BUG: cannot find summary %q in the list of registered summaries", name))
+	}
+	unregisterSummary(sm)
+	return true
+}
+
+// ListMetricNames returns a list of all the metrics in s.
+func (s *Set) ListMetricNames() []string {
+	var list []string
+	for name := range s.m {
+		list = append(list, name)
+	}
+	return list
 }

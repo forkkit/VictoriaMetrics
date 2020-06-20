@@ -2,6 +2,7 @@ package storage
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -158,6 +159,29 @@ func (b *Block) tooBig() bool {
 	return false
 }
 
+func (b *Block) deduplicateSamplesDuringMerge() {
+	if len(b.values) == 0 {
+		// Nothing to dedup or the data is already marshaled.
+		return
+	}
+	srcTimestamps := b.timestamps[b.nextIdx:]
+	srcValues := b.values[b.nextIdx:]
+	timestamps, values := deduplicateSamplesDuringMerge(srcTimestamps, srcValues)
+	dedups := len(srcTimestamps) - len(timestamps)
+	atomic.AddUint64(&dedupsDuringMerge, uint64(dedups))
+	b.timestamps = b.timestamps[:b.nextIdx+len(timestamps)]
+	b.values = b.values[:b.nextIdx+len(values)]
+}
+
+var dedupsDuringMerge uint64
+
+func (b *Block) rowsCount() int {
+	if len(b.values) == 0 {
+		return int(b.bh.RowsCount)
+	}
+	return len(b.values[b.nextIdx:])
+}
+
 // MarshalData marshals the block into binary representation.
 func (b *Block) MarshalData(timestampsBlockOffset, valuesBlockOffset uint64) ([]byte, []byte, []byte) {
 	if len(b.values) == 0 {
@@ -244,7 +268,10 @@ func (b *Block) UnmarshalData() error {
 	if err != nil {
 		return err
 	}
-	encoding.EnsureNonDecreasingSequence(b.timestamps, b.bh.MinTimestamp, b.bh.MaxTimestamp)
+	if b.bh.PrecisionBits < 64 {
+		// Recover timestamps order after lossy compression.
+		encoding.EnsureNonDecreasingSequence(b.timestamps, b.bh.MinTimestamp, b.bh.MaxTimestamp)
+	}
 	b.timestampsData = b.timestampsData[:0]
 
 	b.values, err = encoding.UnmarshalValues(b.values[:0], b.valuesData, b.bh.ValuesMarshalType, b.bh.FirstValue, int(b.bh.RowsCount))

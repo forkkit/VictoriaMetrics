@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -11,9 +12,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
+	"github.com/VictoriaMetrics/metrics"
 )
 
-var loggerLevel = flag.String("loggerLevel", "INFO", "Minimum level of errors to log. Possible values: INFO, ERROR, FATAL, PANIC")
+var (
+	loggerLevel  = flag.String("loggerLevel", "INFO", "Minimum level of errors to log. Possible values: INFO, WARN, ERROR, FATAL, PANIC")
+	loggerFormat = flag.String("loggerFormat", "default", "Format for logs. Possible values: default, json")
+	loggerOutput = flag.String("loggerOutput", "stderr", "Output for the logs. Supported values: stderr, stdout")
+)
 
 // Init initializes the logger.
 //
@@ -21,17 +29,41 @@ var loggerLevel = flag.String("loggerLevel", "INFO", "Minimum level of errors to
 //
 // There is no need in calling Init from tests.
 func Init() {
+	setLoggerOutput()
 	validateLoggerLevel()
+	validateLoggerFormat()
 	go errorsLoggedCleaner()
 	logAllFlags()
 }
 
+func setLoggerOutput() {
+	switch *loggerOutput {
+	case "stderr":
+		output = os.Stderr
+	case "stdout":
+		output = os.Stdout
+	default:
+		panic(fmt.Errorf("FATAL: unsupported `loggerOutput` value: %q; supported values are: stderr, stdout", *loggerOutput))
+	}
+}
+
+var output io.Writer = os.Stderr
+
 func validateLoggerLevel() {
 	switch *loggerLevel {
-	case "INFO", "ERROR", "FATAL", "PANIC":
+	case "INFO", "WARN", "ERROR", "FATAL", "PANIC":
 	default:
 		// We cannot use logger.Panicf here, since the logger isn't initialized yet.
-		panic(fmt.Errorf("FATAL: unsupported `-loggerLevel` value: %q; supported values are: INFO, ERROR, FATAL, PANIC", *loggerLevel))
+		panic(fmt.Errorf("FATAL: unsupported `-loggerLevel` value: %q; supported values are: INFO, WARN, ERROR, FATAL, PANIC", *loggerLevel))
+	}
+}
+
+func validateLoggerFormat() {
+	switch *loggerFormat {
+	case "default", "json":
+	default:
+		// We cannot use logger.Pancif here, since the logger isn't initialized yet.
+		panic(fmt.Errorf("FATAL: unsupported `-loggerFormat` value: %q; supported values are: default, json", *loggerFormat))
 	}
 }
 
@@ -47,9 +79,24 @@ func Infof(format string, args ...interface{}) {
 	logLevel("INFO", format, args...)
 }
 
+// Warnf logs warn message.
+func Warnf(format string, args ...interface{}) {
+	logLevel("WARN", format, args...)
+}
+
 // Errorf logs error message.
 func Errorf(format string, args ...interface{}) {
 	logLevel("ERROR", format, args...)
+}
+
+// WarnfSkipframes logs warn message and skips the given number of frames for the caller.
+func WarnfSkipframes(skipframes int, format string, args ...interface{}) {
+	logLevelSkipframes(skipframes, "WARN", format, args...)
+}
+
+// ErrorfSkipframes logs error message and skips the given number of frames for the caller.
+func ErrorfSkipframes(skipframes int, format string, args ...interface{}) {
+	logLevelSkipframes(skipframes, "ERROR", format, args...)
 }
 
 // Fatalf logs fatal message and terminates the app.
@@ -63,19 +110,15 @@ func Panicf(format string, args ...interface{}) {
 }
 
 func logLevel(level, format string, args ...interface{}) {
+	logLevelSkipframes(1, level, format, args...)
+}
+
+func logLevelSkipframes(skipframes int, level, format string, args ...interface{}) {
 	if shouldSkipLog(level) {
 		return
 	}
-
-	// rate limit ERROR log messages
-	if level == "ERROR" {
-		if n := atomic.AddUint64(&errorsLogged, 1); n > 10 {
-			return
-		}
-	}
-
 	msg := fmt.Sprintf(format, args...)
-	logMessage(level, msg, 3)
+	logMessage(level, msg, 3+skipframes)
 }
 
 func errorsLoggedCleaner() {
@@ -91,14 +134,19 @@ type logWriter struct {
 }
 
 func (lw *logWriter) Write(p []byte) (int, error) {
-	if !shouldSkipLog("ERROR") {
-		logMessage("ERROR", string(p), 4)
-	}
+	logLevelSkipframes(2, "ERROR", "%s", p)
 	return len(p), nil
 }
 
 func logMessage(level, msg string, skipframes int) {
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000+0000")
+	// rate limit ERROR log messages
+	if level == "ERROR" {
+		if n := atomic.AddUint64(&errorsLogged, 1); n > 10 {
+			return
+		}
+	}
+
+	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	levelLowercase := strings.ToLower(level)
 	_, file, line, ok := runtime.Caller(skipframes)
 	if !ok {
@@ -112,15 +160,31 @@ func logMessage(level, msg string, skipframes int) {
 	for len(msg) > 0 && msg[len(msg)-1] == '\n' {
 		msg = msg[:len(msg)-1]
 	}
-	logMsg := fmt.Sprintf("%s\t%s\t%s:%d\t%s\n", timestamp, levelLowercase, file, line, msg)
+	var logMsg string
+	switch *loggerFormat {
+	case "json":
+		caller := fmt.Sprintf("%s:%d", file, line)
+		logMsg = fmt.Sprintf(`{"ts":%q,"level":%q,"caller":%q,"msg":%q}`+"\n", timestamp, levelLowercase, caller, msg)
+	default:
+		logMsg = fmt.Sprintf("%s\t%s\t%s:%d\t%s\n", timestamp, levelLowercase, file, line, msg)
+	}
 
 	// Serialize writes to log.
 	mu.Lock()
-	fmt.Fprint(os.Stderr, logMsg)
+	fmt.Fprint(output, logMsg)
 	mu.Unlock()
+
+	// Increment vm_log_messages_total
+	location := fmt.Sprintf("%s:%d", file, line)
+	counterName := fmt.Sprintf(`vm_log_messages_total{app_version=%q, level=%q, location=%q}`, buildinfo.Version, levelLowercase, location)
+	metrics.GetOrCreateCounter(counterName).Inc()
 
 	switch level {
 	case "PANIC":
+		if *loggerFormat == "json" {
+			// Do not clutter `json` output with panic stack trace
+			os.Exit(-1)
+		}
 		panic(errors.New(msg))
 	case "FATAL":
 		os.Exit(-1)
@@ -131,6 +195,13 @@ var mu sync.Mutex
 
 func shouldSkipLog(level string) bool {
 	switch *loggerLevel {
+	case "WARN":
+		switch level {
+		case "WARN", "ERROR", "FATAL", "PANIC":
+			return false
+		default:
+			return true
+		}
 	case "ERROR":
 		switch level {
 		case "ERROR", "FATAL", "PANIC":

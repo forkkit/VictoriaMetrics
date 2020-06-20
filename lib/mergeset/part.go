@@ -5,7 +5,9 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
@@ -52,12 +54,12 @@ type part struct {
 
 	mrs []metaindexRow
 
-	indexFile fs.ReadAtCloser
-	itemsFile fs.ReadAtCloser
-	lensFile  fs.ReadAtCloser
+	indexFile fs.MustReadAtCloser
+	itemsFile fs.MustReadAtCloser
+	lensFile  fs.MustReadAtCloser
 
-	idxbCache indexBlockCache
-	ibCache   inmemoryBlockCache
+	idxbCache *indexBlockCache
+	ibCache   *inmemoryBlockCache
 }
 
 func openFilePart(path string) (*part, error) {
@@ -106,7 +108,7 @@ func openFilePart(path string) (*part, error) {
 	return newPart(&ph, path, size, metaindexFile, indexFile, itemsFile, lensFile)
 }
 
-func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, indexFile, itemsFile, lensFile fs.ReadAtCloser) (*part, error) {
+func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, indexFile, itemsFile, lensFile fs.MustReadAtCloser) (*part, error) {
 	var errors []error
 	mrs, err := unmarshalMetaindexRows(nil, metaindexReader)
 	if err != nil {
@@ -114,18 +116,18 @@ func newPart(ph *partHeader, path string, size uint64, metaindexReader filestrea
 	}
 	metaindexReader.MustClose()
 
-	p := &part{
-		path: path,
-		size: size,
-		mrs:  mrs,
+	var p part
+	p.path = path
+	p.size = size
+	p.mrs = mrs
 
-		indexFile: indexFile,
-		itemsFile: itemsFile,
-		lensFile:  lensFile,
-	}
+	p.indexFile = indexFile
+	p.itemsFile = itemsFile
+	p.lensFile = lensFile
+
 	p.ph.CopyFrom(ph)
-	p.idxbCache.Init()
-	p.ibCache.Init()
+	p.idxbCache = newIndexBlockCache()
+	p.ibCache = newInmemoryBlockCache()
 
 	if len(errors) > 0 {
 		// Return only the first error, since it has no sense in returning all errors.
@@ -133,7 +135,7 @@ func newPart(ph *partHeader, path string, size uint64, metaindexReader filestrea
 		p.MustClose()
 		return nil, err
 	}
-	return p, nil
+	return &p, nil
 }
 
 func (p *part) MustClose() {
@@ -141,8 +143,8 @@ func (p *part) MustClose() {
 	p.itemsFile.MustClose()
 	p.lensFile.MustClose()
 
-	p.idxbCache.Reset()
-	p.ibCache.Reset()
+	p.idxbCache.MustClose()
+	p.ibCache.MustClose()
 }
 
 type indexBlock struct {
@@ -165,65 +167,98 @@ func putIndexBlock(idxb *indexBlock) {
 var indexBlockPool sync.Pool
 
 type indexBlockCache struct {
-	m         map[uint64]*indexBlock
-	missesMap map[uint64]uint64
-	mu        sync.RWMutex
-
+	// Atomically updated counters must go first in the struct, so they are properly
+	// aligned to 8 bytes on 32-bit architectures.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
 	requests uint64
 	misses   uint64
+
+	m  map[uint64]*indexBlockCacheEntry
+	mu sync.RWMutex
+
+	cleanerStopCh chan struct{}
+	cleanerWG     sync.WaitGroup
 }
 
-func (idxbc *indexBlockCache) Init() {
-	idxbc.m = make(map[uint64]*indexBlock)
-	idxbc.missesMap = make(map[uint64]uint64)
-	idxbc.requests = 0
-	idxbc.misses = 0
+type indexBlockCacheEntry struct {
+	// Atomically updated counters must go first in the struct, so they are properly
+	// aligned to 8 bytes on 32-bit architectures.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
+	lastAccessTime uint64
+
+	idxb *indexBlock
 }
 
-func (idxbc *indexBlockCache) Reset() {
-	atomic.AddUint64(&indexBlockCacheRequests, idxbc.requests)
-	atomic.AddUint64(&indexBlockCacheMisses, idxbc.misses)
+func newIndexBlockCache() *indexBlockCache {
+	var idxbc indexBlockCache
+	idxbc.m = make(map[uint64]*indexBlockCacheEntry)
+	idxbc.cleanerStopCh = make(chan struct{})
+	idxbc.cleanerWG.Add(1)
+	go func() {
+		defer idxbc.cleanerWG.Done()
+		idxbc.cleaner()
+	}()
+	return &idxbc
+}
+
+func (idxbc *indexBlockCache) MustClose() {
+	close(idxbc.cleanerStopCh)
+	idxbc.cleanerWG.Wait()
+
 	// It is safe returning idxbc.m to pool, since the Reset must be called
 	// when the idxbc entries are no longer accessed by concurrent goroutines.
-	for _, idxb := range idxbc.m {
-		putIndexBlock(idxb)
+	for _, idxbe := range idxbc.m {
+		putIndexBlock(idxbe.idxb)
 	}
-	idxbc.Init()
+	idxbc.m = nil
 }
 
-var (
-	indexBlockCacheRequests uint64
-	indexBlockCacheMisses   uint64
-)
+// cleaner periodically cleans least recently used items.
+func (idxbc *indexBlockCache) cleaner() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			idxbc.cleanByTimeout()
+		case <-idxbc.cleanerStopCh:
+			return
+		}
+	}
+}
+
+func (idxbc *indexBlockCache) cleanByTimeout() {
+	currentTime := fasttime.UnixTimestamp()
+	idxbc.mu.Lock()
+	for k, idxbe := range idxbc.m {
+		// Delete items accessed more than 10 minutes ago.
+		if currentTime-atomic.LoadUint64(&idxbe.lastAccessTime) > 10*60 {
+			delete(idxbc.m, k)
+		}
+	}
+	idxbc.mu.Unlock()
+}
 
 func (idxbc *indexBlockCache) Get(k uint64) *indexBlock {
 	atomic.AddUint64(&idxbc.requests, 1)
 	idxbc.mu.RLock()
-	idxb := idxbc.m[k]
+	idxbe := idxbc.m[k]
 	idxbc.mu.RUnlock()
 
-	if idxb != nil {
-		return idxb
+	if idxbe != nil {
+		currentTime := fasttime.UnixTimestamp()
+		if atomic.LoadUint64(&idxbe.lastAccessTime) != currentTime {
+			atomic.StoreUint64(&idxbe.lastAccessTime, currentTime)
+		}
+		return idxbe.idxb
 	}
 	atomic.AddUint64(&idxbc.misses, 1)
-	idxbc.mu.Lock()
-	idxbc.missesMap[k]++
-	idxbc.mu.Unlock()
 	return nil
 }
 
 // Put puts idxb under the key k into idxbc.
-//
-// Returns true if the idxb has been put into idxbc.
-func (idxbc *indexBlockCache) Put(k uint64, idxb *indexBlock) bool {
+func (idxbc *indexBlockCache) Put(k uint64, idxb *indexBlock) {
 	idxbc.mu.Lock()
-
-	if idxbc.missesMap[k] < 2 {
-		// Do not pollute cache with infrequently accessed items, since they may
-		// evict frequently accessed items.
-		idxbc.mu.Unlock()
-		return false
-	}
 
 	// Remove superflouos entries.
 	if overflow := len(idxbc.m) - getMaxCachedIndexBlocksPerPart(); overflow > 0 {
@@ -239,23 +274,14 @@ func (idxbc *indexBlockCache) Put(k uint64, idxb *indexBlock) bool {
 			}
 		}
 	}
-	if overflow := len(idxbc.missesMap) - 8*getMaxCachedIndexBlocksPerPart(); overflow > 0 {
-		// Remove 10% of items from the cache.
-		overflow = int(float64(len(idxbc.missesMap)) * 0.1)
-		for k := range idxbc.missesMap {
-			delete(idxbc.missesMap, k)
-			overflow--
-			if overflow == 0 {
-				break
-			}
-		}
-	}
 
-	// Store the frequently accessed idxb in the cache.
-	delete(idxbc.missesMap, k)
-	idxbc.m[k] = idxb
+	// Store idxb in the cache.
+	idxbe := &indexBlockCacheEntry{
+		lastAccessTime: fasttime.UnixTimestamp(),
+		idxb:           idxb,
+	}
+	idxbc.m[k] = idxbe
 	idxbc.mu.Unlock()
-	return true
 }
 
 func (idxbc *indexBlockCache) Len() uint64 {
@@ -274,12 +300,17 @@ func (idxbc *indexBlockCache) Misses() uint64 {
 }
 
 type inmemoryBlockCache struct {
-	m         map[inmemoryBlockCacheKey]*inmemoryBlock
-	missesMap map[inmemoryBlockCacheKey]uint64
-	mu        sync.RWMutex
-
+	// Atomically updated counters must go first in the struct, so they are properly
+	// aligned to 8 bytes on 32-bit architectures.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
 	requests uint64
 	misses   uint64
+
+	m  map[inmemoryBlockCacheKey]*inmemoryBlockCacheEntry
+	mu sync.RWMutex
+
+	cleanerStopCh chan struct{}
+	cleanerWG     sync.WaitGroup
 }
 
 type inmemoryBlockCacheKey struct {
@@ -295,60 +326,89 @@ func (ibck *inmemoryBlockCacheKey) Init(bh *blockHeader) {
 	ibck.itemsBlockOffset = bh.itemsBlockOffset
 }
 
-func (ibc *inmemoryBlockCache) Init() {
-	ibc.m = make(map[inmemoryBlockCacheKey]*inmemoryBlock)
-	ibc.missesMap = make(map[inmemoryBlockCacheKey]uint64)
-	ibc.requests = 0
-	ibc.misses = 0
+type inmemoryBlockCacheEntry struct {
+	// Atomically updated counters must go first in the struct, so they are properly
+	// aligned to 8 bytes on 32-bit architectures.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
+	lastAccessTime uint64
+
+	ib *inmemoryBlock
 }
 
-func (ibc *inmemoryBlockCache) Reset() {
-	atomic.AddUint64(&inmemoryBlockCacheRequests, ibc.requests)
-	atomic.AddUint64(&inmemoryBlockCacheMisses, ibc.misses)
+func newInmemoryBlockCache() *inmemoryBlockCache {
+	var ibc inmemoryBlockCache
+	ibc.m = make(map[inmemoryBlockCacheKey]*inmemoryBlockCacheEntry)
+
+	ibc.cleanerStopCh = make(chan struct{})
+	ibc.cleanerWG.Add(1)
+	go func() {
+		defer ibc.cleanerWG.Done()
+		ibc.cleaner()
+	}()
+	return &ibc
+}
+
+func (ibc *inmemoryBlockCache) MustClose() {
+	close(ibc.cleanerStopCh)
+	ibc.cleanerWG.Wait()
+
 	// It is safe returning ibc.m entries to pool, since the Reset function may be called
 	// only if no other goroutines access ibc entries.
-	for _, ib := range ibc.m {
-		putInmemoryBlock(ib)
+	for _, ibe := range ibc.m {
+		putInmemoryBlock(ibe.ib)
 	}
-	ibc.Init()
+	ibc.m = nil
 }
 
-var (
-	inmemoryBlockCacheRequests uint64
-	inmemoryBlockCacheMisses   uint64
-)
+// cleaner periodically cleans least recently used items.
+func (ibc *inmemoryBlockCache) cleaner() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ibc.cleanByTimeout()
+		case <-ibc.cleanerStopCh:
+			return
+		}
+	}
+}
+
+func (ibc *inmemoryBlockCache) cleanByTimeout() {
+	currentTime := fasttime.UnixTimestamp()
+	ibc.mu.Lock()
+	for k, ibe := range ibc.m {
+		// Delete items accessed more than 10 minutes ago.
+		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 10*60 {
+			delete(ibc.m, k)
+		}
+	}
+	ibc.mu.Unlock()
+}
 
 func (ibc *inmemoryBlockCache) Get(k inmemoryBlockCacheKey) *inmemoryBlock {
 	atomic.AddUint64(&ibc.requests, 1)
 
 	ibc.mu.RLock()
-	ib := ibc.m[k]
+	ibe := ibc.m[k]
 	ibc.mu.RUnlock()
 
-	if ib != nil {
-		return ib
+	if ibe != nil {
+		currentTime := fasttime.UnixTimestamp()
+		if atomic.LoadUint64(&ibe.lastAccessTime) != currentTime {
+			atomic.StoreUint64(&ibe.lastAccessTime, currentTime)
+		}
+		return ibe.ib
 	}
 	atomic.AddUint64(&ibc.misses, 1)
-	ibc.mu.Lock()
-	ibc.missesMap[k]++
-	ibc.mu.Unlock()
 	return nil
 }
 
 // Put puts ib under key k into ibc.
-//
-// Returns true if ib was put into ibc.
-func (ibc *inmemoryBlockCache) Put(k inmemoryBlockCacheKey, ib *inmemoryBlock) bool {
+func (ibc *inmemoryBlockCache) Put(k inmemoryBlockCacheKey, ib *inmemoryBlock) {
 	ibc.mu.Lock()
 
-	if ibc.missesMap[k] < 2 {
-		// Do not cache entry with low number of accesses, since it may evict
-		// frequently accessed entries from the cache.
-		ibc.mu.Unlock()
-		return false
-	}
-
-	// Clean superflouos entries in ibc.m and ibc.missesMap.
+	// Clean superflouos entries in cache.
 	if overflow := len(ibc.m) - getMaxCachedInmemoryBlocksPerPart(); overflow > 0 {
 		// Remove 10% of items from the cache.
 		overflow = int(float64(len(ibc.m)) * 0.1)
@@ -362,23 +422,14 @@ func (ibc *inmemoryBlockCache) Put(k inmemoryBlockCacheKey, ib *inmemoryBlock) b
 			}
 		}
 	}
-	if overflow := len(ibc.missesMap) - 8*getMaxCachedInmemoryBlocksPerPart(); overflow > 0 {
-		// Remove 10% of items from the cache.
-		overflow = int(float64(len(ibc.missesMap)) * 0.1)
-		for k := range ibc.missesMap {
-			delete(ibc.missesMap, k)
-			overflow--
-			if overflow == 0 {
-				break
-			}
-		}
-	}
 
-	// The entry is frequently accessed, so store it in the cache.
-	delete(ibc.missesMap, k)
-	ibc.m[k] = ib
+	// Store ib in the cache.
+	ibe := &inmemoryBlockCacheEntry{
+		lastAccessTime: fasttime.UnixTimestamp(),
+		ib:             ib,
+	}
+	ibc.m[k] = ibe
 	ibc.mu.Unlock()
-	return true
 }
 
 func (ibc *inmemoryBlockCache) Len() uint64 {

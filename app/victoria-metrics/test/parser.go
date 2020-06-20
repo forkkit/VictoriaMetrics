@@ -1,5 +1,3 @@
-// +build integration
-
 package test
 
 import (
@@ -15,12 +13,15 @@ var (
 	extractRegex      = regexp.MustCompile(`"?{([^}]*)}"?`)
 )
 
+// PopulateTimeTplString substitutes {TIME_*} with t in s and returns the result.
 func PopulateTimeTplString(s string, t time.Time) string {
 	return string(PopulateTimeTpl([]byte(s), t))
 }
 
-func PopulateTimeTpl(b []byte, t time.Time) []byte {
+// PopulateTimeTpl substitutes {TIME_*} with tGlobal in b and returns the result.
+func PopulateTimeTpl(b []byte, tGlobal time.Time) []byte {
 	return parseTimeExpRegex.ReplaceAllFunc(b, func(repl []byte) []byte {
+		t := tGlobal
 		repl = extractRegex.FindSubmatch(repl)[1]
 		parts := strings.SplitN(string(repl), "-", 2)
 		if len(parts) == 2 {
@@ -40,7 +41,7 @@ func PopulateTimeTpl(b []byte, t time.Time) []byte {
 		case `TIME_NS`:
 			return []byte(fmt.Sprintf("%d", t.UnixNano()))
 		default:
-			log.Fatalf("unkown time pattern %s in %s", parts[0], repl)
+			log.Fatalf("unknown time pattern %s in %s", parts[0], repl)
 		}
 		return repl
 	})

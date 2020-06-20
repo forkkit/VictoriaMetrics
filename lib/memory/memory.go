@@ -8,7 +8,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
-var allowedMemPercent = flag.Float64("memory.allowedPercent", 60, "Allowed percent of system memory VictoriaMetrics caches may occupy")
+var allowedMemPercent = flag.Float64("memory.allowedPercent", 60, "Allowed percent of system memory VictoriaMetrics caches may occupy. "+
+	"Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. "+
+	"Too high value may evict too much data from OS page cache, which will result in higher disk IO usage")
 
 var (
 	allowedMemory   int
@@ -22,8 +24,8 @@ func initOnce() {
 		// Do not use logger.Panicf here, since logger may be uninitialized yet.
 		panic(fmt.Errorf("BUG: memory.Allowed must be called only after flag.Parse call"))
 	}
-	if *allowedMemPercent < 10 || *allowedMemPercent > 200 {
-		logger.Panicf("FATAL: -memory.allowedPercent must be in the range [10...200]; got %f", *allowedMemPercent)
+	if *allowedMemPercent < 1 || *allowedMemPercent > 200 {
+		logger.Panicf("FATAL: -memory.allowedPercent must be in the range [1...200]; got %f", *allowedMemPercent)
 	}
 	percent := *allowedMemPercent / 100
 

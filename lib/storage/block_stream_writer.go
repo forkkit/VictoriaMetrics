@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -17,10 +18,14 @@ type blockStreamWriter struct {
 	compressLevel int
 	path          string
 
-	timestampsWriter filestream.WriteCloser
-	valuesWriter     filestream.WriteCloser
-	indexWriter      filestream.WriteCloser
-	metaindexWriter  filestream.WriteCloser
+	// Use io.Writer type for timestampsWriter and valuesWriter
+	// in order to remove I2I conversion in WriteExternalBlock
+	// when passing them to fs.MustWriteData
+	timestampsWriter io.Writer
+	valuesWriter     io.Writer
+
+	indexWriter     filestream.WriteCloser
+	metaindexWriter filestream.WriteCloser
 
 	mr metaindexRow
 
@@ -33,6 +38,11 @@ type blockStreamWriter struct {
 
 	metaindexData           []byte
 	compressedMetaindexData []byte
+}
+
+func (bsw *blockStreamWriter) assertWriteClosers() {
+	_ = bsw.timestampsWriter.(filestream.WriteCloser)
+	_ = bsw.valuesWriter.(filestream.WriteCloser)
 }
 
 // Init initializes bsw with the given writers.
@@ -61,12 +71,17 @@ func (bsw *blockStreamWriter) reset() {
 // InitFromInmemoryPart initialzes bsw from inmemory part.
 func (bsw *blockStreamWriter) InitFromInmemoryPart(mp *inmemoryPart) {
 	bsw.reset()
-	bsw.compressLevel = 0
+
+	// Use the minimum compression level for in-memory blocks,
+	// since they are going to be re-compressed during the merge into file-based blocks.
+	bsw.compressLevel = -5 // See https://github.com/facebook/zstd/releases/tag/v1.3.4
 
 	bsw.timestampsWriter = &mp.timestampsData
 	bsw.valuesWriter = &mp.valuesData
 	bsw.indexWriter = &mp.indexData
 	bsw.metaindexWriter = &mp.metaindexData
+
+	bsw.assertWriteClosers()
 }
 
 // InitFromFilePart initializes bsw from a file-based part on the given path.
@@ -126,6 +141,8 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	bsw.indexWriter = indexFile
 	bsw.metaindexWriter = metaindexFile
 
+	bsw.assertWriteClosers()
+
 	return nil
 }
 
@@ -141,8 +158,8 @@ func (bsw *blockStreamWriter) MustClose() {
 	fs.MustWriteData(bsw.metaindexWriter, bsw.compressedMetaindexData)
 
 	// Close writers.
-	bsw.timestampsWriter.MustClose()
-	bsw.valuesWriter.MustClose()
+	bsw.timestampsWriter.(filestream.WriteCloser).MustClose()
+	bsw.valuesWriter.(filestream.WriteCloser).MustClose()
 	bsw.indexWriter.MustClose()
 	bsw.metaindexWriter.MustClose()
 
@@ -157,6 +174,8 @@ func (bsw *blockStreamWriter) MustClose() {
 
 // WriteExternalBlock writes b to bsw and updates ph and rowsMerged.
 func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsMerged *uint64) {
+	atomic.AddUint64(rowsMerged, uint64(b.rowsCount()))
+	b.deduplicateSamplesDuringMerge()
 	headerData, timestampsData, valuesData := b.MarshalData(bsw.timestampsBlockOffset, bsw.valuesBlockOffset)
 
 	bsw.indexData = append(bsw.indexData, headerData...)
@@ -172,7 +191,6 @@ func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsM
 	bsw.valuesBlockOffset += uint64(len(valuesData))
 
 	updatePartHeader(b, ph)
-	atomic.AddUint64(rowsMerged, uint64(b.bh.RowsCount))
 }
 
 func updatePartHeader(b *Block, ph *partHeader) {

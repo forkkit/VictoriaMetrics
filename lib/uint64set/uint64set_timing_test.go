@@ -8,6 +8,107 @@ import (
 	"github.com/valyala/fastrand"
 )
 
+func BenchmarkUnionNoOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start+uint64(itemsCount), itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkUnion(b, sa, sb)
+		})
+	}
+}
+
+func BenchmarkUnionPartialOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start+uint64(itemsCount/2), itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkUnion(b, sa, sb)
+		})
+	}
+}
+
+func BenchmarkUnionFullOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start, itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkUnion(b, sa, sb)
+		})
+	}
+}
+
+func benchmarkUnion(b *testing.B, sa, sb *Set) {
+	b.ReportAllocs()
+	b.SetBytes(int64(sa.Len() + sb.Len()))
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			saCopy := sa.Clone()
+			sbCopy := sb.Clone()
+			saCopy.Union(sb)
+			sbCopy.Union(sa)
+		}
+	})
+}
+
+func BenchmarkIntersectNoOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start+uint64(itemsCount), itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkIntersect(b, sa, sb)
+		})
+	}
+}
+
+func BenchmarkIntersectPartialOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start+uint64(itemsCount/2), itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkIntersect(b, sa, sb)
+		})
+	}
+}
+
+func BenchmarkIntersectFullOverlap(b *testing.B) {
+	for _, itemsCount := range []int{1e3, 1e4, 1e5, 1e6, 1e7} {
+		start := uint64(time.Now().UnixNano())
+		sa := createRangeSet(start, itemsCount)
+		sb := createRangeSet(start, itemsCount)
+		b.Run(fmt.Sprintf("items_%d", itemsCount), func(b *testing.B) {
+			benchmarkIntersect(b, sa, sb)
+		})
+	}
+}
+
+func benchmarkIntersect(b *testing.B, sa, sb *Set) {
+	b.ReportAllocs()
+	b.SetBytes(int64(sa.Len() + sb.Len()))
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			saCopy := sa.Clone()
+			sbCopy := sb.Clone()
+			saCopy.Intersect(sb)
+			sbCopy.Intersect(sa)
+		}
+	})
+}
+
+func createRangeSet(start uint64, itemsCount int) *Set {
+	var s Set
+	for i := 0; i < itemsCount; i++ {
+		n := start + uint64(i)
+		s.Add(n)
+	}
+	return &s
+}
+
 func BenchmarkSetAddRandomLastBits(b *testing.B) {
 	const itemsCount = 1e5
 	for _, lastBits := range []uint64{20, 24, 28, 32} {
@@ -16,10 +117,10 @@ func BenchmarkSetAddRandomLastBits(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(itemsCount))
 			b.RunParallel(func(pb *testing.PB) {
+				var rng fastrand.RNG
 				for pb.Next() {
 					start := uint64(time.Now().UnixNano())
 					var s Set
-					var rng fastrand.RNG
 					for i := 0; i < itemsCount; i++ {
 						n := start | (uint64(rng.Uint32()) & mask)
 						s.Add(n)
@@ -38,10 +139,10 @@ func BenchmarkMapAddRandomLastBits(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(itemsCount))
 			b.RunParallel(func(pb *testing.PB) {
+				var rng fastrand.RNG
 				for pb.Next() {
 					start := uint64(time.Now().UnixNano())
 					m := make(map[uint64]struct{})
-					var rng fastrand.RNG
 					for i := 0; i < itemsCount; i++ {
 						n := start | (uint64(rng.Uint32()) & mask)
 						m[n] = struct{}{}

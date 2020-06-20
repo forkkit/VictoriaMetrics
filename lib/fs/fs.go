@@ -6,71 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"sync/atomic"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/metrics"
 	"golang.org/x/sys/unix"
-)
-
-// ReadAtCloser is rand-access read interface.
-type ReadAtCloser interface {
-	// ReadAt must read len(p) bytes from offset off to p.
-	ReadAt(p []byte, off int64)
-
-	// MustClose must close the reader.
-	MustClose()
-}
-
-// ReaderAt implements rand-access read.
-type ReaderAt struct {
-	f *os.File
-}
-
-// ReadAt reads len(p) bytes from off to p.
-func (ra *ReaderAt) ReadAt(p []byte, off int64) {
-	if len(p) == 0 {
-		return
-	}
-	n, err := ra.f.ReadAt(p, off)
-	if err != nil {
-		logger.Panicf("FATAL: cannot read %d bytes at offset %d of file %q: %s", len(p), off, ra.f.Name(), err)
-	}
-	if n != len(p) {
-		logger.Panicf("FATAL: unexpected number of bytes read; got %d; want %d", n, len(p))
-	}
-	readCalls.Inc()
-	readBytes.Add(len(p))
-}
-
-// MustClose closes ra.
-func (ra *ReaderAt) MustClose() {
-	if err := ra.f.Close(); err != nil {
-		logger.Panicf("FATAL: cannot close file %q: %s", ra.f.Name(), err)
-	}
-	readersCount.Dec()
-}
-
-// OpenReaderAt opens a file on the given path for random-read access.
-//
-// The file must be closed with MustClose when no longer needed.
-func OpenReaderAt(path string) (*ReaderAt, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	readersCount.Inc()
-	ra := &ReaderAt{
-		f: f,
-	}
-	return ra, nil
-}
-
-var (
-	readCalls    = metrics.NewCounter(`vm_fs_read_calls_total`)
-	readBytes    = metrics.NewCounter(`vm_fs_read_bytes_total`)
-	readersCount = metrics.NewCounter(`vm_fs_readers`)
 )
 
 // MustSyncPath syncs contents of the given path.
@@ -92,7 +34,7 @@ var tmpFileNum uint64
 
 // WriteFileAtomically atomically writes data to the given file path.
 //
-// WriteFile returns only after the file is fully written and synced
+// WriteFileAtomically returns only after the file is fully written and synced
 // to the underlying storage.
 func WriteFileAtomically(path string, data []byte) error {
 	// Check for the existing file. It is expected that
@@ -174,7 +116,7 @@ func mkdirSync(path string) error {
 	return nil
 }
 
-// RemoveDirContents removes all the contents of the given dir it it exists.
+// RemoveDirContents removes all the contents of the given dir if it exists.
 //
 // It doesn't remove the dir itself, so the dir may be mounted
 // to a separate partition.
@@ -246,7 +188,17 @@ func mustSyncParentDirIfExists(path string) {
 //
 // It properly handles NFS issue https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
 func MustRemoveAll(path string) {
-	_ = mustRemoveAll(path)
+	_ = mustRemoveAll(path, func() {})
+}
+
+// MustRemoveAllWithDoneCallback removes path with all the contents.
+//
+// done is called after the path is successfully removed.
+//
+// done may be called after the function returns for NFS path.
+// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61.
+func MustRemoveAllWithDoneCallback(path string, done func()) {
+	_ = mustRemoveAll(path, done)
 }
 
 // HardLinkFiles makes hard links for all the files from srcDir in dstDir.
@@ -346,6 +298,35 @@ func CreateFlockFile(dir string) (*os.File, error) {
 
 // MustGetFreeSpace returns free space for the given directory path.
 func MustGetFreeSpace(path string) uint64 {
+	// Try obtaining cached value at first.
+	freeSpaceMapLock.Lock()
+	defer freeSpaceMapLock.Unlock()
+
+	e, ok := freeSpaceMap[path]
+	if ok && fasttime.UnixTimestamp()-e.updateTime < 2 {
+		// Fast path - the entry is fresh.
+		return e.freeSpace
+	}
+
+	// Slow path.
+	// Determine the amount of free space at path.
+	e.freeSpace = mustGetFreeSpace(path)
+	e.updateTime = fasttime.UnixTimestamp()
+	freeSpaceMap[path] = e
+	return e.freeSpace
+}
+
+var (
+	freeSpaceMap     = make(map[string]freeSpaceEntry)
+	freeSpaceMapLock sync.Mutex
+)
+
+type freeSpaceEntry struct {
+	updateTime uint64
+	freeSpace  uint64
+}
+
+func mustGetFreeSpace(path string) uint64 {
 	d, err := os.Open(path)
 	if err != nil {
 		logger.Panicf("FATAL: cannot determine free disk space on %q: %s", path, err)

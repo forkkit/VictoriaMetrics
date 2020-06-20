@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
@@ -34,11 +35,15 @@ type table struct {
 
 // partitionWrapper provides refcounting mechanism for the partition.
 type partitionWrapper struct {
-	pt       *partition
+	// Atomic counters must be at the top of struct for proper 8-byte alignment on 32-bit archs.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
+
 	refCount uint64
 
 	// The partition must be dropped if mustDrop > 0
 	mustDrop uint64
+
+	pt *partition
 }
 
 func (ptw *partitionWrapper) incRef() {
@@ -166,7 +171,7 @@ func (tb *table) CreateSnapshot(snapshotName string) (string, string, error) {
 	fs.MustSyncPath(filepath.Dir(dstSmallDir))
 	fs.MustSyncPath(filepath.Dir(dstBigDir))
 
-	logger.Infof("created table snapshot for %q at (%q, %q) in %s", tb.path, dstSmallDir, dstBigDir, time.Since(startTime))
+	logger.Infof("created table snapshot for %q at (%q, %q) in %.3f seconds", tb.path, dstSmallDir, dstBigDir, time.Since(startTime).Seconds())
 	return dstSmallDir, dstBigDir, nil
 }
 
@@ -216,7 +221,7 @@ func (tb *table) flushRawRows() {
 	defer tb.PutPartitions(ptws)
 
 	for _, ptw := range ptws {
-		ptw.pt.flushRawRows(nil, true)
+		ptw.pt.flushRawRows(true)
 	}
 }
 
@@ -349,7 +354,7 @@ func (tb *table) AddRows(rows []rawRow) error {
 }
 
 func (tb *table) getMinMaxTimestamps() (int64, int64) {
-	now := timestampFromTime(time.Now())
+	now := int64(fasttime.UnixTimestamp() * 1000)
 	minTimestamp := now - tb.retentionMilliseconds
 	maxTimestamp := now + 2*24*3600*1000 // allow max +2 days from now due to timezones shit :)
 	if minTimestamp < 0 {
@@ -371,16 +376,16 @@ func (tb *table) startRetentionWatcher() {
 }
 
 func (tb *table) retentionWatcher() {
-	t := time.NewTimer(time.Minute)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-tb.stop:
 			return
-		case <-t.C:
-			t.Reset(time.Minute)
+		case <-ticker.C:
 		}
 
-		minTimestamp := timestampFromTime(time.Now()) - tb.retentionMilliseconds
+		minTimestamp := int64(fasttime.UnixTimestamp()*1000) - tb.retentionMilliseconds
 		var ptwsDrop []*partitionWrapper
 		tb.ptwsLock.Lock()
 		dst := tb.ptws[:0]
@@ -432,27 +437,17 @@ func (tb *table) PutPartitions(ptws []*partitionWrapper) {
 }
 
 func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set) ([]*partition, error) {
-	smallD, err := os.Open(smallPartitionsPath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open directory with small partitions %q: %s", smallPartitionsPath, err)
+	// Certain partition directories in either `big` or `small` dir may be missing
+	// after restoring from backup. So populate partition names from both dirs.
+	ptNames := make(map[string]bool)
+	if err := populatePartitionNames(smallPartitionsPath, ptNames); err != nil {
+		return nil, err
 	}
-	defer fs.MustClose(smallD)
-
-	fis, err := smallD.Readdir(-1)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read directory with small partitions %q: %s", smallPartitionsPath, err)
+	if err := populatePartitionNames(bigPartitionsPath, ptNames); err != nil {
+		return nil, err
 	}
 	var pts []*partition
-	for _, fi := range fis {
-		if !fs.IsDirOrSymlink(fi) {
-			// Skip non-directories
-			continue
-		}
-		ptName := fi.Name()
-		if ptName == "snapshots" {
-			// Skipe directory with snapshots
-			continue
-		}
+	for ptName := range ptNames {
 		smallPartsPath := smallPartitionsPath + "/" + ptName
 		bigPartsPath := bigPartitionsPath + "/" + ptName
 		pt, err := openPartition(smallPartsPath, bigPartsPath, getDeletedMetricIDs)
@@ -463,6 +458,32 @@ func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMet
 		pts = append(pts, pt)
 	}
 	return pts, nil
+}
+
+func populatePartitionNames(partitionsPath string, ptNames map[string]bool) error {
+	d, err := os.Open(partitionsPath)
+	if err != nil {
+		return fmt.Errorf("cannot open directory with partitions %q: %s", partitionsPath, err)
+	}
+	defer fs.MustClose(d)
+
+	fis, err := d.Readdir(-1)
+	if err != nil {
+		return fmt.Errorf("cannot read directory with partitions %q: %s", partitionsPath, err)
+	}
+	for _, fi := range fis {
+		if !fs.IsDirOrSymlink(fi) {
+			// Skip non-directories
+			continue
+		}
+		ptName := fi.Name()
+		if ptName == "snapshots" {
+			// Skip directory with snapshots
+			continue
+		}
+		ptNames[ptName] = true
+	}
+	return nil
 }
 
 func mustClosePartitions(pts []*partition) {

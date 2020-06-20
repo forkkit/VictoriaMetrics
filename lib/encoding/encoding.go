@@ -5,6 +5,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fastnum"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
@@ -165,24 +166,24 @@ func unmarshalInt64Array(dst []int64, src []byte, mt MarshalType, firstValue int
 		bb := bbPool.Get()
 		bb.B, err = DecompressZSTD(bb.B[:0], src)
 		if err != nil {
-			return nil, fmt.Errorf("cannot decompress zstd data of size %d: %s", len(src), err)
+			return nil, fmt.Errorf("cannot decompress zstd data of size %d: %s; src_zstd=%X", len(src), err, src)
 		}
 		dst, err = unmarshalInt64NearestDelta(dst, bb.B, firstValue, itemsCount)
 		bbPool.Put(bb)
 		if err != nil {
-			return nil, fmt.Errorf("cannot unmarshal nearest delta data after zstd decompression: %s", err)
+			return nil, fmt.Errorf("cannot unmarshal nearest delta data after zstd decompression: %s; src_zstd=%X", err, src)
 		}
 		return dst, nil
 	case MarshalTypeZSTDNearestDelta2:
 		bb := bbPool.Get()
 		bb.B, err = DecompressZSTD(bb.B[:0], src)
 		if err != nil {
-			return nil, fmt.Errorf("cannot decompress zstd data of size %d: %s", len(src), err)
+			return nil, fmt.Errorf("cannot decompress zstd data of size %d: %s; src_zstd=%X", len(src), err, src)
 		}
 		dst, err = unmarshalInt64NearestDelta2(dst, bb.B, firstValue, itemsCount)
 		bbPool.Put(bb)
 		if err != nil {
-			return nil, fmt.Errorf("cannot unmarshal nearest delta2 data after zstd decompression: %s", err)
+			return nil, fmt.Errorf("cannot unmarshal nearest delta2 data after zstd decompression: %s; src_zstd=%X", err, src)
 		}
 		return dst, nil
 	case MarshalTypeNearestDelta:
@@ -200,6 +201,14 @@ func unmarshalInt64Array(dst []int64, src []byte, mt MarshalType, firstValue int
 	case MarshalTypeConst:
 		if len(src) > 0 {
 			return nil, fmt.Errorf("unexpected data left in const encoding: %d bytes", len(src))
+		}
+		if firstValue == 0 {
+			dst = fastnum.AppendInt64Zeros(dst, itemsCount)
+			return dst, nil
+		}
+		if firstValue == 1 {
+			dst = fastnum.AppendInt64Ones(dst, itemsCount)
+			return dst, nil
 		}
 		for itemsCount > 0 {
 			dst = append(dst, firstValue)
@@ -266,6 +275,14 @@ func EnsureNonDecreasingSequence(a []int64, vMin, vMax int64) {
 func isConst(a []int64) bool {
 	if len(a) == 0 {
 		return false
+	}
+	if fastnum.IsInt64Zeros(a) {
+		// Fast path for array containing only zeros.
+		return true
+	}
+	if fastnum.IsInt64Ones(a) {
+		// Fast path for array containing only ones.
+		return true
 	}
 	v1 := a[0]
 	for _, v := range a {
